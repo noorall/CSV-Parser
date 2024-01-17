@@ -23,7 +23,6 @@ import (
 	"slices"
 	"strings"
 
-	"csvReader/config"
 	"github.com/spkg/bom"
 )
 
@@ -33,28 +32,14 @@ var (
 	errUnexpectedQuoteField    = errors.New(
 		"syntax error: cannot have consecutive fields without separator")
 	// LargestEntryLimit is the max size for reading file to buf
-	LargestEntryLimit = 120 * 1024 * 1024
-	BufferSizeScale   = int64(5)
+	LargestEntryLimit       = 120 * 1024 * 1024
+	BufferSizeScale         = int64(5)
+	ReadBlockSize     int64 = 64 * 1024
 )
-
-type ReaderCloser interface {
-	io.Reader
-	io.Closer
-}
 
 type Field struct {
 	Val    string
 	IsNull bool
-}
-
-// Row is the content of a row.
-type Row struct {
-	// RowID is the row id of the row.
-	// as objects of this struct is reused, this RowID is increased when reading
-	// next row.
-	RowID  int64
-	Fields []Field
-	Length int
 }
 
 type escapeFlavor uint8
@@ -65,9 +50,38 @@ const (
 	escapeFlavorMySQLWithNull
 )
 
+type CSVConfig struct {
+	// they can only be used by LOAD DATA
+	// https://dev.mysql.com/doc/refman/8.0/en/load-data.html#load-data-field-line-handling
+	LineStartingBy   string
+	LineTerminatedBy string
+
+	FieldTerminatedBy string
+	FieldEnclosedBy   string
+	FieldEscapedBy    string
+
+	Null              []string
+	Header            bool
+	HeaderSchemaMatch bool
+	TrimLastSep       bool
+	NotNull           bool
+
+	AllowEmptyLine bool
+	// For non-empty FieldEnclosedBy (for example quotes), null elements inside quotes are not considered as null except for
+	// `\N` (when escape-by is `\`). That is to say, `\N` is special for null because it always means null.
+	QuotedNullIsText bool
+	// ref https://dev.mysql.com/doc/refman/8.0/en/load-data.html
+	// > If the field begins with the ENCLOSED BY character, instances of that character are recognized as terminating a
+	// > field value only if followed by the field or line TERMINATED BY sequence.
+	// This means we will meet unescaped quote in a quoted field
+	// > The "BIG" boss      -> The "BIG" boss
+	// This means we will meet unescaped quote in a unquoted field
+	UnescapedQuote bool
+}
+
 // CSVParser is basically a copy of encoding/csv, but special-cased for MySQL-like input.
 type CSVParser struct {
-	cfg *config.CSVConfig
+	cfg CSVConfig
 
 	comma          []byte
 	quote          []byte
@@ -110,7 +124,7 @@ type CSVParser struct {
 	quotedNullIsText bool
 	unescapedQuote   bool
 
-	reader ReaderCloser
+	reader io.ReadCloser
 	// stores data that has NOT been parsed yet, it shares same memory as appendBuf.
 	buf []byte
 	// used to read data from the reader, the data will be moved to other buffers.
@@ -120,7 +134,9 @@ type CSVParser struct {
 	// The list of column names of the last INSERT statement.
 	columns []string
 
-	lastRow Row
+	lastRow []Field
+	rowID   int
+	length  int
 	// the reader position we have parsed, if the underlying reader is not
 	// a compressed file, it's the file position we have parsed too.
 	// this value may go backward when failed to read quoted field, but it's
@@ -131,6 +147,8 @@ type CSVParser struct {
 	// cache
 	remainBuf *bytes.Buffer
 	appendBuf *bytes.Buffer
+
+	reuseRow bool
 }
 
 type field struct {
@@ -140,17 +158,18 @@ type field struct {
 
 // NewCSVParser creates a CSV parser.
 func NewCSVParser(
-	cfg *config.CSVConfig,
-	reader ReaderCloser,
+	cfg CSVConfig,
+	reader io.ReadCloser,
 	blockBufSize int64,
 	shouldParseHeader bool,
+	reuseRow bool,
 ) (*CSVParser, error) {
 	var err error
 	var separator, delimiter, terminator string
 
-	separator = cfg.Separator
-	delimiter = cfg.Delimiter
-	terminator = cfg.Terminator
+	separator = cfg.FieldTerminatedBy
+	delimiter = cfg.FieldEnclosedBy
+	terminator = cfg.LineTerminatedBy
 
 	var quoteStopSet, newLineStopSet []byte
 	unquoteStopSet := []byte{separator[0]}
@@ -166,23 +185,24 @@ func NewCSVParser(
 	}
 	unquoteStopSet = append(unquoteStopSet, newLineStopSet...)
 
-	if len(cfg.StartingBy) > 0 {
-		if strings.Contains(cfg.StartingBy, terminator) {
-			return nil, errors.New(fmt.Sprintf("STARTING BY '%s' cannot contain LINES TERMINATED BY '%s'", cfg.StartingBy, terminator))
+	if len(cfg.LineStartingBy) > 0 {
+		if strings.Contains(cfg.LineStartingBy, terminator) {
+			return nil, errors.New(fmt.Sprintf("STARTING BY '%s' cannot contain LINES TERMINATED BY '%s'", cfg.LineStartingBy, terminator))
 		}
 	}
 
 	escFlavor := escapeFlavorNone
 	var r *regexp.Regexp
-	if len(cfg.EscapedBy) > 0 {
+
+	if len(cfg.FieldEscapedBy) > 0 {
 		escFlavor = escapeFlavorMySQL
-		quoteStopSet = append(quoteStopSet, cfg.EscapedBy[0])
-		unquoteStopSet = append(unquoteStopSet, cfg.EscapedBy[0])
+		quoteStopSet = append(quoteStopSet, cfg.FieldEscapedBy[0])
+		unquoteStopSet = append(unquoteStopSet, cfg.FieldEscapedBy[0])
 		// we need special treatment of the NULL value \N, used by MySQL.
-		if !cfg.NotNull && slices.Contains(cfg.Null, cfg.EscapedBy+`N`) {
+		if !cfg.NotNull && slices.Contains(cfg.Null, cfg.FieldEscapedBy+`N`) {
 			escFlavor = escapeFlavorMySQLWithNull
 		}
-		r, err = regexp.Compile(`(?s)` + regexp.QuoteMeta(cfg.EscapedBy) + `.`)
+		r, err = regexp.Compile(`(?s)` + regexp.QuoteMeta(cfg.FieldEscapedBy) + `.`)
 		if err != nil {
 			return nil, err
 		}
@@ -196,8 +216,8 @@ func NewCSVParser(
 		comma:             []byte(separator),
 		quote:             []byte(delimiter),
 		newLine:           []byte(terminator),
-		startingBy:        []byte(cfg.StartingBy),
-		escapedBy:         cfg.EscapedBy,
+		startingBy:        []byte(cfg.LineStartingBy),
+		escapedBy:         cfg.FieldEscapedBy,
 		unescapeRegexp:    r,
 		escFlavor:         escFlavor,
 		quoteByteSet:      makeByteSet(quoteStopSet),
@@ -207,27 +227,33 @@ func NewCSVParser(
 		allowEmptyLine:    cfg.AllowEmptyLine,
 		quotedNullIsText:  cfg.QuotedNullIsText,
 		unescapedQuote:    cfg.UnescapedQuote,
+		reuseRow:          reuseRow,
 	}, nil
 }
+func (parser *CSVParser) Read() (row []Field, err error) {
+	if parser.reuseRow {
+		row, err = parser.readRow(parser.lastRow)
+		parser.lastRow = row
+	} else {
+		row, err = parser.readRow(nil)
+	}
+	return row, err
+}
 
-// ReadRow reads a row from the datafile.
-func (parser *CSVParser) ReadRow() error {
-	row := &parser.lastRow
-	row.Length = 0
-	row.RowID++
-
+// readRow reads a row from the datafile.
+func (parser *CSVParser) readRow(row []Field) ([]Field, error) {
 	// skip the header first
 	if parser.shouldParseHeader {
 		err := parser.readColumns()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		parser.shouldParseHeader = false
 	}
 
 	records, err := parser.readRecord(parser.lastRecord)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	parser.lastRecord = records
 	// remove the last empty value
@@ -237,28 +263,21 @@ func (parser *CSVParser) ReadRow() error {
 			records = records[:i]
 		}
 	}
-
-	row.Fields = row.Fields[:0]
-	if cap(row.Fields) >= len(records) {
-		row.Fields = row.Fields[:len(records)]
-	} else {
-		row.Fields = make([]Field, len(records))
+	row = row[:0]
+	if cap(row) < len(records) {
+		row = make([]Field, len(records))
 	}
+	row = row[:len(records)]
 	for i, record := range records {
-		row.Length += len(record.content)
 		unescaped, isNull, err := parser.unescapeString(record)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		row.Fields[i].IsNull = isNull
-		if isNull {
-			row.Fields[i].Val = ""
-		} else {
-			row.Fields[i].Val = unescaped
-		}
+		row[i].IsNull = isNull
+		row[i].Val = unescaped
 	}
 
-	return nil
+	return row, nil
 }
 
 func (parser *CSVParser) unescapeString(input field) (unescaped string, isNull bool, err error) {
@@ -326,7 +345,9 @@ func (parser *CSVParser) peekBytes(cnt int) ([]byte, error) {
 	if len(parser.buf) == 0 {
 		return nil, io.EOF
 	}
-	cnt = min(cnt, len(parser.buf))
+	if len(parser.buf) < cnt {
+		cnt = len(parser.buf)
+	}
 	return parser.buf[:cnt], nil
 }
 
@@ -722,6 +743,46 @@ func (parser *CSVParser) readUntilTerminator() ([]byte, int64, error) {
 	}
 }
 
+func (parser *CSVParser) readBlock() error {
+	n, err := io.ReadFull(parser.reader, parser.blockBuf)
+
+	switch {
+	case errors.Is(err, io.ErrUnexpectedEOF), err == io.EOF:
+		parser.isLastChunk = true
+		fallthrough
+	case err == nil:
+		// `parser.buf` reference to `appendBuf.Bytes`, so should use remainBuf to
+		// hold the `parser.buf` rest data to prevent slice overlap
+		parser.remainBuf.Reset()
+		parser.remainBuf.Write(parser.buf)
+		parser.appendBuf.Reset()
+		parser.appendBuf.Write(parser.remainBuf.Bytes())
+		blockData := parser.blockBuf[:n]
+		if parser.pos == 0 {
+			bomCleanedData := bom.Clean(blockData)
+			parser.pos += int64(n - len(bomCleanedData))
+			blockData = bomCleanedData
+		}
+		parser.appendBuf.Write(blockData)
+		parser.buf = parser.appendBuf.Bytes()
+		return nil
+	default:
+		return err
+	}
+}
+
+func (parser *CSVParser) Close() error {
+	return parser.reader.Close()
+}
+
+func (parser *CSVParser) Columns() []string {
+	return parser.columns
+}
+
+func (parser *CSVParser) SetColumns(columns []string) {
+	parser.columns = columns
+}
+
 func unescape(
 	input string,
 	delim string,
@@ -758,58 +819,40 @@ func unescape(
 	return input
 }
 
-func (parser *CSVParser) readBlock() error {
-	n, err := io.ReadFull(parser.reader, parser.blockBuf)
+// Copyright 2009 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
-	switch err {
-	case io.ErrUnexpectedEOF, io.EOF:
-		parser.isLastChunk = true
-		fallthrough
-	case nil:
-		// `parser.buf` reference to `appendBuf.Bytes`, so should use remainBuf to
-		// hold the `parser.buf` rest data to prevent slice overlap
-		parser.remainBuf.Reset()
-		parser.remainBuf.Write(parser.buf)
-		parser.appendBuf.Reset()
-		parser.appendBuf.Write(parser.remainBuf.Bytes())
-		blockData := parser.blockBuf[:n]
-		if parser.pos == 0 {
-			bomCleanedData := bom.Clean(blockData)
-			parser.pos += int64(n - len(bomCleanedData))
-			blockData = bomCleanedData
-		}
-		parser.appendBuf.Write(blockData)
-		parser.buf = parser.appendBuf.Bytes()
-		return nil
-	default:
-		return err
+// Package bytes implements functions for the manipulation of byte slices.
+// It is analogous to the facilities of the strings package.
+
+// this part is copy from `bytes/bytes.go`
+
+// byteSet is a 32-byte value, where each bit represents the presence of a
+// given byte value in the set.
+type byteSet [8]uint32
+
+// makeByteSet creates a set of byte value.
+func makeByteSet(chars []byte) (as byteSet) {
+	for i := 0; i < len(chars); i++ {
+		c := chars[i]
+		as[c>>5] |= 1 << uint(c&31)
 	}
+	return as
 }
 
-func (parser *CSVParser) Close() error {
-	return parser.reader.Close()
+// contains reports whether c is inside the set.
+func (as *byteSet) contains(c byte) bool {
+	return (as[c>>5] & (1 << uint(c&31))) != 0
 }
 
-// LastRow is the copy of the row parsed by the last call to ReadRow().
-func (parser *CSVParser) LastRow() Row {
-	return parser.lastRow
-}
-
-func (parser *CSVParser) Columns() []string {
-	return parser.columns
-}
-
-func (parser *CSVParser) SetColumns(columns []string) {
-	parser.columns = columns
-}
-
-// SetRowID changes the reported row ID when we firstly read compressed files.
-func (parser *CSVParser) SetRowID(rowID int64) {
-	parser.lastRow.RowID = rowID
-}
-
-// Pos returns the current file offset.
-// Attention: for compressed sql/csv files, pos is the position in uncompressed files
-func (parser *CSVParser) Pos() (pos int64, lastRowID int64) {
-	return parser.pos, parser.lastRow.RowID
+// IndexAnyByte returns the byte index of the first occurrence in s of any of the byte
+// points in chars. It returns -1 if  there is no code point in common.
+func IndexAnyByte(s []byte, as *byteSet) int {
+	for i, c := range s {
+		if as.contains(c) {
+			return i
+		}
+	}
+	return -1
 }
