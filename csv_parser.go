@@ -75,13 +75,13 @@ type CSVConfig struct {
 	// > field value only if followed by the field or line TERMINATED BY sequence.
 	// This means we will meet unescaped quote in a quoted field
 	// > The "BIG" boss      -> The "BIG" boss
-	// This means we will meet unescaped quote in a unquoted field
+	// This means we will meet unescaped quote in an unquoted field
 	UnescapedQuote bool
 }
 
 // CSVParser is basically a copy of encoding/csv, but special-cased for MySQL-like input.
 type CSVParser struct {
-	cfg CSVConfig
+	cfg *CSVConfig
 
 	comma          []byte
 	quote          []byte
@@ -110,7 +110,7 @@ type CSVParser struct {
 	recordBuffer []byte
 
 	// fieldIndexes is an index of fields inside recordBuffer.
-	// The i'th field ends at offset fieldIndexes[i] in recordBuffer.
+	// The width field ends at offset fieldIndexes[i] in recordBuffer.
 	fieldIndexes  []int
 	fieldIsQuoted []bool
 
@@ -124,7 +124,7 @@ type CSVParser struct {
 	quotedNullIsText bool
 	unescapedQuote   bool
 
-	reader io.ReadCloser
+	reader io.Reader
 	// stores data that has NOT been parsed yet, it shares same memory as appendBuf.
 	buf []byte
 	// used to read data from the reader, the data will be moved to other buffers.
@@ -158,8 +158,8 @@ type field struct {
 
 // NewCSVParser creates a CSV parser.
 func NewCSVParser(
-	cfg CSVConfig,
-	reader io.ReadCloser,
+	cfg *CSVConfig,
+	reader io.Reader,
 	blockBufSize int64,
 	shouldParseHeader bool,
 	reuseRow bool,
@@ -238,6 +238,10 @@ func (parser *CSVParser) Read() (row []Field, err error) {
 		row, err = parser.readRow(nil)
 	}
 	return row, err
+}
+
+func (parser *CSVParser) Pos() int64 {
+	return parser.pos
 }
 
 // readRow reads a row from the datafile.
@@ -771,10 +775,6 @@ func (parser *CSVParser) readBlock() error {
 	}
 }
 
-func (parser *CSVParser) Close() error {
-	return parser.reader.Close()
-}
-
 func (parser *CSVParser) Columns() []string {
 	return parser.columns
 }
@@ -846,7 +846,7 @@ func (as *byteSet) contains(c byte) bool {
 	return (as[c>>5] & (1 << uint(c&31))) != 0
 }
 
-// IndexAnyByte returns the byte index of the first occurrence in s of any of the byte
+// IndexAnyByte returns the byte index of the first occurrence in s of any in the byte
 // points in chars. It returns -1 if  there is no code point in common.
 func IndexAnyByte(s []byte, as *byteSet) int {
 	for i, c := range s {
