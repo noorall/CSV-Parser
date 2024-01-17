@@ -1,71 +1,86 @@
 package mydump_test
 
 import (
-	"context"
 	mydump "csvReader"
 	"csvReader/config"
-	"csvReader/types"
-	"csvReader/worker"
 	"github.com/stretchr/testify/require"
 	"strings"
 	"testing"
 )
 
-var ioWorkersForCSV = worker.NewPool(context.Background(), 5, "test_csv")
-
-func assertPosEqual(t *testing.T, parser mydump.Parser, expectPos, expectRowID int64) {
+func assertPosEqual(t *testing.T, parser *mydump.CSVParser, expectPos, expectRowID int64) {
 	pos, rowID := parser.Pos()
 	require.Equal(t, expectPos, pos)
 	require.Equal(t, expectRowID, rowID)
 }
 
-var nullDatum types.Datum
+var nullDatum = newStringField("", true)
 
-func tpchDatums() [][]types.Datum {
-	datums := make([][]types.Datum, 0, 3)
-	datums = append(datums, []types.Datum{
-		types.NewStringDatum("1"),
-		types.NewStringDatum("goldenrod lavender spring chocolate lace"),
-		types.NewStringDatum("Manufacturer#1"),
-		types.NewStringDatum("Brand#13"),
-		types.NewStringDatum("PROMO BURNISHED COPPER"),
-		types.NewStringDatum("7"),
-		types.NewStringDatum("JUMBO PKG"),
-		types.NewStringDatum("901.00"),
-		types.NewStringDatum("ly. slyly ironi"),
+func newStringField(val string, isNull bool) mydump.Field {
+	return mydump.Field{
+		Val:    val,
+		IsNull: isNull,
+	}
+}
+
+// StringReader is a wrapper around *strings.Reader with an additional Close() method
+type StringReader struct{ *strings.Reader }
+
+// NewStringReader constructs a new StringReader
+func NewStringReader(s string) StringReader {
+	return StringReader{Reader: strings.NewReader(s)}
+}
+
+// Close implements io.Closer
+func (StringReader) Close() error {
+	return nil
+}
+
+func tpchDatums() [][]mydump.Field {
+	datums := make([][]mydump.Field, 0, 3)
+	datums = append(datums, []mydump.Field{
+		newStringField("1", false),
+		newStringField("goldenrod lavender spring chocolate lace", false),
+		newStringField("Manufacturer#1", false),
+		newStringField("Brand#13", false),
+		newStringField("PROMO BURNISHED COPPER", false),
+		newStringField("7", false),
+		newStringField("JUMBO PKG", false),
+		newStringField("901.00", false),
+		newStringField("ly. slyly ironi", false),
 	})
-	datums = append(datums, []types.Datum{
-		types.NewStringDatum("2"),
-		types.NewStringDatum("blush thistle blue yellow saddle"),
-		types.NewStringDatum("Manufacturer#1"),
-		types.NewStringDatum("Brand#13"),
-		types.NewStringDatum("LARGE BRUSHED BRASS"),
-		types.NewStringDatum("1"),
-		types.NewStringDatum("LG CASE"),
-		types.NewStringDatum("902.00"),
-		types.NewStringDatum("lar accounts amo"),
+	datums = append(datums, []mydump.Field{
+		newStringField("2", false),
+		newStringField("blush thistle blue yellow saddle", false),
+		newStringField("Manufacturer#1", false),
+		newStringField("Brand#13", false),
+		newStringField("LARGE BRUSHED BRASS", false),
+		newStringField("1", false),
+		newStringField("LG CASE", false),
+		newStringField("902.00", false),
+		newStringField("lar accounts amo", false),
 	})
-	datums = append(datums, []types.Datum{
-		types.NewStringDatum("3"),
-		types.NewStringDatum("spring green yellow purple cornsilk"),
-		types.NewStringDatum("Manufacturer#4"),
-		types.NewStringDatum("Brand#42"),
-		types.NewStringDatum("STANDARD POLISHED BRASS"),
-		types.NewStringDatum("21"),
-		types.NewStringDatum("WRAP CASE"),
-		types.NewStringDatum("903.00"),
-		types.NewStringDatum("egular deposits hag"),
+	datums = append(datums, []mydump.Field{
+		newStringField("3", false),
+		newStringField("spring green yellow purple cornsilk", false),
+		newStringField("Manufacturer#4", false),
+		newStringField("Brand#42", false),
+		newStringField("STANDARD POLISHED BRASS", false),
+		newStringField("21", false),
+		newStringField("WRAP CASE", false),
+		newStringField("903.00", false),
+		newStringField("egular deposits hag", false),
 	})
 
 	return datums
 }
 
-func datumsToString(datums [][]types.Datum, delimitor string, quote string, lastSep bool) string {
+func datumsToString(datums [][]mydump.Field, delimitor string, quote string, lastSep bool) string {
 	var b strings.Builder
 	doubleQuote := quote + quote
 	for _, ds := range datums {
 		for i, d := range ds {
-			text := d.GetString()
+			text := d.Val
 			if len(quote) > 0 {
 				b.WriteString(quote)
 				b.WriteString(strings.ReplaceAll(text, quote, doubleQuote))
@@ -84,21 +99,20 @@ func datumsToString(datums [][]types.Datum, delimitor string, quote string, last
 
 func TestTPCH(t *testing.T) {
 	datums := tpchDatums()
-	input := datumsToString(datums, "|", "", true)
-	reader := mydump.NewStringReader(input)
+	input := datumsToString(datums, ",", "", true)
+	reader := strings.NewReader(input)
 
 	cfg := config.CSVConfig{
-		Separator:   "|",
-		Delimiter:   "",
-		TrimLastSep: true,
+		Separator: ",",
+		Delimiter: "",
 	}
 
-	parser, err := mydump.NewCSVParser(context.Background(), &cfg, reader, int64(config.ReadBlockSize), ioWorkersForCSV, false)
+	parser, err := mydump.NewCSVParser(&cfg, reader, int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID:  1,
-		Row:    datums[0],
+		Fields: datums[0],
 		Length: 116,
 	}, parser.LastRow())
 	assertPosEqual(t, parser, 126, 1)
@@ -106,7 +120,7 @@ func TestTPCH(t *testing.T) {
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID:  2,
-		Row:    datums[1],
+		Fields: datums[1],
 		Length: 104,
 	}, parser.LastRow())
 	assertPosEqual(t, parser, 241, 2)
@@ -114,7 +128,7 @@ func TestTPCH(t *testing.T) {
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID:  3,
-		Row:    datums[2],
+		Fields: datums[2],
 		Length: 117,
 	}, parser.LastRow())
 	assertPosEqual(t, parser, 369, 3)
@@ -169,14 +183,14 @@ func TestTPCHMultiBytes(t *testing.T) {
 			TrimLastSep: false,
 		}
 
-		reader := mydump.NewStringReader(inputStr)
-		parser, err := mydump.NewCSVParser(context.Background(), &cfg, reader, int64(config.ReadBlockSize), ioWorkersForCSV, false)
+		reader := NewStringReader(inputStr)
+		parser, err := mydump.NewCSVParser(&cfg, reader, int64(config.ReadBlockSize), false)
 		require.NoError(t, err)
 
 		for i, expectedParserPos := range allExpectedParserPos {
 			require.Nil(t, parser.ReadRow())
 			require.Equal(t, int64(i+1), parser.LastRow().RowID)
-			require.Equal(t, datums[i], parser.LastRow().Row)
+			require.Equal(t, datums[i], parser.LastRow().Fields)
 			assertPosEqual(t, parser, int64(expectedParserPos), int64(i+1))
 		}
 
@@ -191,16 +205,16 @@ func TestRFC4180(t *testing.T) {
 
 	// example 1, trailing new lines
 
-	parser, err := mydump.NewCSVParser(context.Background(), &cfg, mydump.NewStringReader("aaa,bbb,ccc\nzzz,yyy,xxx\n"), int64(config.ReadBlockSize), ioWorkersForCSV, false)
+	parser, err := mydump.NewCSVParser(&cfg, NewStringReader("aaa,bbb,ccc\nzzz,yyy,xxx\n"), int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum("aaa"),
-			types.NewStringDatum("bbb"),
-			types.NewStringDatum("ccc"),
+		Fields: []mydump.Field{
+			newStringField("aaa", false),
+			newStringField("bbb", false),
+			newStringField("ccc", false),
 		},
 		Length: 9,
 	}, parser.LastRow())
@@ -209,10 +223,10 @@ func TestRFC4180(t *testing.T) {
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 2,
-		Row: []types.Datum{
-			types.NewStringDatum("zzz"),
-			types.NewStringDatum("yyy"),
-			types.NewStringDatum("xxx"),
+		Fields: []mydump.Field{
+			newStringField("zzz", false),
+			newStringField("yyy", false),
+			newStringField("xxx", false),
 		},
 		Length: 9,
 	}, parser.LastRow())
@@ -220,16 +234,16 @@ func TestRFC4180(t *testing.T) {
 
 	// example 2, no trailing new lines
 
-	parser, err = mydump.NewCSVParser(context.Background(), &cfg, mydump.NewStringReader("aaa,bbb,ccc\nzzz,yyy,xxx"), int64(config.ReadBlockSize), ioWorkersForCSV, false)
+	parser, err = mydump.NewCSVParser(&cfg, NewStringReader("aaa,bbb,ccc\nzzz,yyy,xxx"), int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum("aaa"),
-			types.NewStringDatum("bbb"),
-			types.NewStringDatum("ccc"),
+		Fields: []mydump.Field{
+			newStringField("aaa", false),
+			newStringField("bbb", false),
+			newStringField("ccc", false),
 		},
 		Length: 9,
 	}, parser.LastRow())
@@ -238,10 +252,10 @@ func TestRFC4180(t *testing.T) {
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 2,
-		Row: []types.Datum{
-			types.NewStringDatum("zzz"),
-			types.NewStringDatum("yyy"),
-			types.NewStringDatum("xxx"),
+		Fields: []mydump.Field{
+			newStringField("zzz", false),
+			newStringField("yyy", false),
+			newStringField("xxx", false),
 		},
 		Length: 9,
 	}, parser.LastRow())
@@ -249,16 +263,16 @@ func TestRFC4180(t *testing.T) {
 
 	// example 5, quoted fields
 
-	parser, err = mydump.NewCSVParser(context.Background(), &cfg, mydump.NewStringReader(`"aaa","bbb","ccc"`+"\nzzz,yyy,xxx"), int64(config.ReadBlockSize), ioWorkersForCSV, false)
+	parser, err = mydump.NewCSVParser(&cfg, NewStringReader(`"aaa","bbb","ccc"`+"\nzzz,yyy,xxx"), int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum("aaa"),
-			types.NewStringDatum("bbb"),
-			types.NewStringDatum("ccc"),
+		Fields: []mydump.Field{
+			newStringField("aaa", false),
+			newStringField("bbb", false),
+			newStringField("ccc", false),
 		},
 		Length: 9,
 	}, parser.LastRow())
@@ -267,10 +281,10 @@ func TestRFC4180(t *testing.T) {
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 2,
-		Row: []types.Datum{
-			types.NewStringDatum("zzz"),
-			types.NewStringDatum("yyy"),
-			types.NewStringDatum("xxx"),
+		Fields: []mydump.Field{
+			newStringField("zzz", false),
+			newStringField("yyy", false),
+			newStringField("xxx", false),
 		},
 		Length: 9,
 	}, parser.LastRow())
@@ -278,18 +292,18 @@ func TestRFC4180(t *testing.T) {
 
 	// example 6, line breaks within fields
 
-	parser, err = mydump.NewCSVParser(context.Background(), &cfg, mydump.NewStringReader(`"aaa","b
+	parser, err = mydump.NewCSVParser(&cfg, NewStringReader(`"aaa","b
 bb","ccc"
-zzz,yyy,xxx`), int64(config.ReadBlockSize), ioWorkersForCSV, false)
+zzz,yyy,xxx`), int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum("aaa"),
-			types.NewStringDatum("b\nbb"),
-			types.NewStringDatum("ccc"),
+		Fields: []mydump.Field{
+			newStringField("aaa", false),
+			newStringField("b\nbb", false),
+			newStringField("ccc", false),
 		},
 		Length: 10,
 	}, parser.LastRow())
@@ -298,10 +312,10 @@ zzz,yyy,xxx`), int64(config.ReadBlockSize), ioWorkersForCSV, false)
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 2,
-		Row: []types.Datum{
-			types.NewStringDatum("zzz"),
-			types.NewStringDatum("yyy"),
-			types.NewStringDatum("xxx"),
+		Fields: []mydump.Field{
+			newStringField("zzz", false),
+			newStringField("yyy", false),
+			newStringField("xxx", false),
 		},
 		Length: 9,
 	}, parser.LastRow())
@@ -309,16 +323,16 @@ zzz,yyy,xxx`), int64(config.ReadBlockSize), ioWorkersForCSV, false)
 
 	// example 7, quote escaping
 
-	parser, err = mydump.NewCSVParser(context.Background(), &cfg, mydump.NewStringReader(`"aaa","b""bb","ccc"`), int64(config.ReadBlockSize), ioWorkersForCSV, false)
+	parser, err = mydump.NewCSVParser(&cfg, NewStringReader(`"aaa","b""bb","ccc"`), int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum("aaa"),
-			types.NewStringDatum("b\"bb"),
-			types.NewStringDatum("ccc"),
+		Fields: []mydump.Field{
+			newStringField("aaa", false),
+			newStringField("b\"bb", false),
+			newStringField("ccc", false),
 		},
 		Length: 10,
 	}, parser.LastRow())
@@ -336,18 +350,18 @@ func TestMySQL(t *testing.T) {
 		Null:       []string{`\N`},
 	}
 
-	parser, err := mydump.NewCSVParser(context.Background(), &cfg, mydump.NewStringReader(`"\"","\\","\?"
+	parser, err := mydump.NewCSVParser(&cfg, NewStringReader(`"\"","\\","\?"
 "\
-",\N,\\N`), int64(config.ReadBlockSize), ioWorkersForCSV, false)
+",\N,\\N`), int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.NoError(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum(`"`),
-			types.NewStringDatum(`\`),
-			types.NewStringDatum("?"),
+		Fields: []mydump.Field{
+			newStringField(`"`, false),
+			newStringField(`\`, false),
+			newStringField("?", false),
 		},
 		Length: 6,
 	}, parser.LastRow())
@@ -356,78 +370,78 @@ func TestMySQL(t *testing.T) {
 	require.NoError(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 2,
-		Row: []types.Datum{
-			types.NewStringDatum("\n"),
+		Fields: []mydump.Field{
+			newStringField("\n", false),
 			nullDatum,
-			types.NewStringDatum(`\N`),
+			newStringField(`\N`, false),
 		},
 		Length: 7,
 	}, parser.LastRow())
 	assertPosEqual(t, parser, 26, 2)
 
 	parser, err = mydump.NewCSVParser(
-		context.Background(), &cfg,
-		mydump.NewStringReader(`"\0\b\n\r\t\Z\\\  \c\'\""`),
-		int64(config.ReadBlockSize), ioWorkersForCSV, false)
+		&cfg,
+		NewStringReader(`"\0\b\n\r\t\Z\\\  \c\'\""`),
+		int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.NoError(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum(string([]byte{0, '\b', '\n', '\r', '\t', 26, '\\', ' ', ' ', 'c', '\'', '"'})),
+		Fields: []mydump.Field{
+			newStringField(string([]byte{0, '\b', '\n', '\r', '\t', 26, '\\', ' ', ' ', 'c', '\'', '"'}), false),
 		},
 		Length: 23,
 	}, parser.LastRow())
 
 	cfg.UnescapedQuote = true
 	parser, err = mydump.NewCSVParser(
-		context.Background(), &cfg,
-		mydump.NewStringReader(`3,"a string containing a " quote",102.20
+		&cfg,
+		NewStringReader(`3,"a string containing a " quote",102.20
 `),
-		int64(config.ReadBlockSize), ioWorkersForCSV, false)
+		int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.NoError(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum("3"),
-			types.NewStringDatum(`a string containing a " quote`),
-			types.NewStringDatum("102.20"),
+		Fields: []mydump.Field{
+			newStringField("3", false),
+			newStringField(`a string containing a " quote`, false),
+			newStringField("102.20", false),
 		},
 		Length: 36,
 	}, parser.LastRow())
 
 	parser, err = mydump.NewCSVParser(
-		context.Background(), &cfg,
-		mydump.NewStringReader(`3,"a string containing a " quote","102.20"`),
-		int64(config.ReadBlockSize), ioWorkersForCSV, false)
+		&cfg,
+		NewStringReader(`3,"a string containing a " quote","102.20"`),
+		int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.NoError(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum("3"),
-			types.NewStringDatum(`a string containing a " quote`),
-			types.NewStringDatum("102.20"),
+		Fields: []mydump.Field{
+			newStringField("3", false),
+			newStringField(`a string containing a " quote`, false),
+			newStringField("102.20", false),
 		},
 		Length: 36,
 	}, parser.LastRow())
 
 	parser, err = mydump.NewCSVParser(
-		context.Background(), &cfg,
-		mydump.NewStringReader(`"a"b",c"d"e`),
-		int64(config.ReadBlockSize), ioWorkersForCSV, false)
+		&cfg,
+		NewStringReader(`"a"b",c"d"e`),
+		int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.NoError(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum(`a"b`),
-			types.NewStringDatum(`c"d"e`),
+		Fields: []mydump.Field{
+			newStringField(`a"b`, false),
+			newStringField(`c"d"e`, false),
 		},
 		Length: 8,
 	}, parser.LastRow())
@@ -442,18 +456,18 @@ func TestCustomEscapeChar(t *testing.T) {
 		Null:      []string{`!N`},
 	}
 
-	parser, err := mydump.NewCSVParser(context.Background(), &cfg, mydump.NewStringReader(`"!"","!!","!\"
+	parser, err := mydump.NewCSVParser(&cfg, NewStringReader(`"!"","!!","!\"
 "!
-",!N,!!N`), int64(config.ReadBlockSize), ioWorkersForCSV, false)
+",!N,!!N`), int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum(`"`),
-			types.NewStringDatum(`!`),
-			types.NewStringDatum(`\`),
+		Fields: []mydump.Field{
+			newStringField(`"`, false),
+			newStringField(`!`, false),
+			newStringField(`\`, false),
 		},
 		Length: 6,
 	}, parser.LastRow())
@@ -462,10 +476,10 @@ func TestCustomEscapeChar(t *testing.T) {
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 2,
-		Row: []types.Datum{
-			types.NewStringDatum("\n"),
+		Fields: []mydump.Field{
+			newStringField("\n", false),
 			nullDatum,
-			types.NewStringDatum(`!N`),
+			newStringField(`!N`, false),
 		},
 		Length: 7,
 	}, parser.LastRow())
@@ -480,16 +494,16 @@ func TestCustomEscapeChar(t *testing.T) {
 	}
 
 	parser, err = mydump.NewCSVParser(
-		context.Background(), &cfg,
-		mydump.NewStringReader(`"{""itemRangeType"":0,""itemContainType"":0,""shopRangeType"":1,""shopJson"":""[{\""id\"":\""A1234\"",\""shopName\"":\""AAAAAA\""}]""}"`),
-		int64(config.ReadBlockSize), ioWorkersForCSV, false)
+		&cfg,
+		NewStringReader(`"{""itemRangeType"":0,""itemContainType"":0,""shopRangeType"":1,""shopJson"":""[{\""id\"":\""A1234\"",\""shopName\"":\""AAAAAA\""}]""}"`),
+		int64(config.ReadBlockSize), false)
 	require.NoError(t, err)
 
 	require.Nil(t, parser.ReadRow())
 	require.Equal(t, mydump.Row{
 		RowID: 1,
-		Row: []types.Datum{
-			types.NewStringDatum(`{"itemRangeType":0,"itemContainType":0,"shopRangeType":1,"shopJson":"[{\"id\":\"A1234\",\"shopName\":\"AAAAAA\"}]"}`),
+		Fields: []mydump.Field{
+			newStringField(`{"itemRangeType":0,"itemContainType":0,"shopRangeType":1,"shopJson":"[{\"id\":\"A1234\",\"shopName\":\"AAAAAA\"}]"}`, false),
 		},
 		Length: 115,
 	}, parser.LastRow())

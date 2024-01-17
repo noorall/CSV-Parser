@@ -16,16 +16,15 @@ package mydump
 
 import (
 	"bytes"
-	"context"
-	"csvReader/config"
-	"csvReader/types"
-	"csvReader/worker"
 	"errors"
 	"fmt"
 	"io"
 	"regexp"
 	"slices"
 	"strings"
+
+	"csvReader/config"
+	"github.com/spkg/bom"
 )
 
 var (
@@ -34,8 +33,19 @@ var (
 	errUnexpectedQuoteField    = errors.New(
 		"syntax error: cannot have consecutive fields without separator")
 	// LargestEntryLimit is the max size for reading file to buf
-	LargestEntryLimit int = 65535
+	LargestEntryLimit = 120 * 1024 * 1024
+	BufferSizeScale   = int64(5)
 )
+
+type ReaderCloser interface {
+	io.Reader
+	io.Closer
+}
+
+type Field struct {
+	Val    string
+	IsNull bool
+}
 
 // Row is the content of a row.
 type Row struct {
@@ -43,7 +53,7 @@ type Row struct {
 	// as objects of this struct is reused, this RowID is increased when reading
 	// next row.
 	RowID  int64
-	Row    []types.Datum
+	Fields []Field
 	Length int
 }
 
@@ -57,7 +67,6 @@ const (
 
 // CSVParser is basically a copy of encoding/csv, but special-cased for MySQL-like input.
 type CSVParser struct {
-	blockParser
 	cfg *config.CSVConfig
 
 	comma          []byte
@@ -96,10 +105,32 @@ type CSVParser struct {
 	escFlavor escapeFlavor
 	// if set to true, csv parser will treat the first non-empty line as header line
 	shouldParseHeader bool
-	// in LOAD DATA, empty line should be treated as a valid record
+	// in LOAD DATA, empty line should be treated as a valid field
 	allowEmptyLine   bool
 	quotedNullIsText bool
 	unescapedQuote   bool
+
+	reader ReaderCloser
+	// stores data that has NOT been parsed yet, it shares same memory as appendBuf.
+	buf []byte
+	// used to read data from the reader, the data will be moved to other buffers.
+	blockBuf    []byte
+	isLastChunk bool
+
+	// The list of column names of the last INSERT statement.
+	columns []string
+
+	lastRow Row
+	// the reader position we have parsed, if the underlying reader is not
+	// a compressed file, it's the file position we have parsed too.
+	// this value may go backward when failed to read quoted field, but it's
+	// for printing error message, and the parser should not be used later,
+	// so it's ok, see readQuotedField.
+	pos int64
+
+	// cache
+	remainBuf *bytes.Buffer
+	appendBuf *bytes.Buffer
 }
 
 type field struct {
@@ -109,11 +140,9 @@ type field struct {
 
 // NewCSVParser creates a CSV parser.
 func NewCSVParser(
-	ctx context.Context,
 	cfg *config.CSVConfig,
-	reader ReadSeekCloser,
+	reader ReaderCloser,
 	blockBufSize int64,
-	ioWorkers *worker.Pool,
 	shouldParseHeader bool,
 ) (*CSVParser, error) {
 	var err error
@@ -125,7 +154,7 @@ func NewCSVParser(
 
 	var quoteStopSet, newLineStopSet []byte
 	unquoteStopSet := []byte{separator[0]}
-	if len(cfg.Delimiter) > 0 {
+	if len(delimiter) > 0 {
 		quoteStopSet = []byte{delimiter[0]}
 		unquoteStopSet = append(unquoteStopSet, delimiter[0])
 	}
@@ -159,7 +188,10 @@ func NewCSVParser(
 		}
 	}
 	return &CSVParser{
-		blockParser:       makeBlockParser(reader, blockBufSize, ioWorkers),
+		reader:            reader,
+		blockBuf:          make([]byte, blockBufSize*BufferSizeScale),
+		remainBuf:         &bytes.Buffer{},
+		appendBuf:         &bytes.Buffer{},
 		cfg:               cfg,
 		comma:             []byte(separator),
 		quote:             []byte(delimiter),
@@ -176,6 +208,57 @@ func NewCSVParser(
 		quotedNullIsText:  cfg.QuotedNullIsText,
 		unescapedQuote:    cfg.UnescapedQuote,
 	}, nil
+}
+
+// ReadRow reads a row from the datafile.
+func (parser *CSVParser) ReadRow() error {
+	row := &parser.lastRow
+	row.Length = 0
+	row.RowID++
+
+	// skip the header first
+	if parser.shouldParseHeader {
+		err := parser.readColumns()
+		if err != nil {
+			return err
+		}
+		parser.shouldParseHeader = false
+	}
+
+	records, err := parser.readRecord(parser.lastRecord)
+	if err != nil {
+		return err
+	}
+	parser.lastRecord = records
+	// remove the last empty value
+	if parser.cfg.TrimLastSep {
+		i := len(records) - 1
+		if i >= 0 && len(records[i].content) == 0 {
+			records = records[:i]
+		}
+	}
+
+	row.Fields = row.Fields[:0]
+	if cap(row.Fields) >= len(records) {
+		row.Fields = row.Fields[:len(records)]
+	} else {
+		row.Fields = make([]Field, len(records))
+	}
+	for i, record := range records {
+		row.Length += len(record.content)
+		unescaped, isNull, err := parser.unescapeString(record)
+		if err != nil {
+			return err
+		}
+		row.Fields[i].IsNull = isNull
+		if isNull {
+			row.Fields[i].Val = ""
+		} else {
+			row.Fields[i].Val = unescaped
+		}
+	}
+
+	return nil
 }
 
 func (parser *CSVParser) unescapeString(input field) (unescaped string, isNull bool, err error) {
@@ -418,7 +501,7 @@ outside:
 		// end of a line, the substring can still be dropped by rule 2.
 		if len(parser.startingBy) > 0 && !foundStartingByThisLine {
 			oldPos := parser.pos
-			content, _, err := parser.ReadUntilTerminator()
+			content, _, err := parser.readUntilTerminator()
 			if err != nil {
 				if len(content) == 0 {
 					return nil, err
@@ -483,7 +566,7 @@ outside:
 			whitespaceLine = false
 		case csvTokenNewLine:
 			foundStartingByThisLine = false
-			// new line = end of record (ignore empty lines)
+			// new line = end of field (ignore empty lines)
 			prevToken = firstToken
 			if !parser.allowEmptyLine {
 				if isEmptyLine {
@@ -523,7 +606,7 @@ outside:
 		preIdx = idx
 	}
 
-	// Check or update the expected fields per record.
+	// Check or update the expected fields per field.
 	return dst, nil
 }
 
@@ -593,58 +676,8 @@ func (parser *CSVParser) replaceEOF(err error, replaced error) error {
 	return replaced
 }
 
-// ReadRow reads a row from the datafile.
-func (parser *CSVParser) ReadRow() error {
-	row := &parser.lastRow
-	row.Length = 0
-	row.RowID++
-
-	// skip the header first
-	if parser.shouldParseHeader {
-		err := parser.ReadColumns()
-		if err != nil {
-			return err
-		}
-		parser.shouldParseHeader = false
-	}
-
-	records, err := parser.readRecord(parser.lastRecord)
-	if err != nil {
-		return err
-	}
-	parser.lastRecord = records
-	// remove the last empty value
-	if parser.cfg.TrimLastSep {
-		i := len(records) - 1
-		if i >= 0 && len(records[i].content) == 0 {
-			records = records[:i]
-		}
-	}
-
-	row.Row = parser.acquireDatumSlice()
-	if cap(row.Row) >= len(records) {
-		row.Row = row.Row[:len(records)]
-	} else {
-		row.Row = make([]types.Datum, len(records))
-	}
-	for i, record := range records {
-		row.Length += len(record.content)
-		unescaped, isNull, err := parser.unescapeString(record)
-		if err != nil {
-			return err
-		}
-		if isNull {
-			row.Row[i].SetNull()
-		} else {
-			row.Row[i].SetString(unescaped)
-		}
-	}
-
-	return nil
-}
-
-// ReadColumns reads the columns of this CSV file.
-func (parser *CSVParser) ReadColumns() error {
+// readColumns reads the columns of this CSV file.
+func (parser *CSVParser) readColumns() error {
 	columns, err := parser.readRecord(nil)
 	if err != nil {
 		return err
@@ -663,14 +696,14 @@ func (parser *CSVParser) ReadColumns() error {
 	return nil
 }
 
-// ReadUntilTerminator seeks the file until the terminator token is found, and
+// readUntilTerminator seeks the file until the terminator token is found, and
 // returns
 // - the content with terminator, or the content read before meet error
 // - the file offset beyond the terminator, or the offset when meet error
 // - error
 // Note that the terminator string pattern may be the content of a field, which
 // means it's inside quotes. Caller should make sure to handle this case.
-func (parser *CSVParser) ReadUntilTerminator() ([]byte, int64, error) {
+func (parser *CSVParser) readUntilTerminator() ([]byte, int64, error) {
 	var ret []byte
 	for {
 		content, firstByte, err := parser.readUntil(&parser.newLineByteSet)
@@ -687,4 +720,96 @@ func (parser *CSVParser) ReadUntilTerminator() ([]byte, int64, error) {
 			return ret, parser.pos, err
 		}
 	}
+}
+
+func unescape(
+	input string,
+	delim string,
+	escFlavor escapeFlavor,
+	escChar byte,
+	unescapeRegexp *regexp.Regexp,
+) string {
+	if len(delim) > 0 {
+		delim2 := delim + delim
+		if strings.Contains(input, delim2) {
+			input = strings.ReplaceAll(input, delim2, delim)
+		}
+	}
+	if escFlavor != escapeFlavorNone && strings.IndexByte(input, escChar) != -1 {
+		input = unescapeRegexp.ReplaceAllStringFunc(input, func(substr string) string {
+			switch substr[1] {
+			case '0':
+				return "\x00"
+			case 'b':
+				return "\b"
+			case 'n':
+				return "\n"
+			case 'r':
+				return "\r"
+			case 't':
+				return "\t"
+			case 'Z':
+				return "\x1a"
+			default:
+				return substr[1:]
+			}
+		})
+	}
+	return input
+}
+
+func (parser *CSVParser) readBlock() error {
+	n, err := io.ReadFull(parser.reader, parser.blockBuf)
+
+	switch err {
+	case io.ErrUnexpectedEOF, io.EOF:
+		parser.isLastChunk = true
+		fallthrough
+	case nil:
+		// `parser.buf` reference to `appendBuf.Bytes`, so should use remainBuf to
+		// hold the `parser.buf` rest data to prevent slice overlap
+		parser.remainBuf.Reset()
+		parser.remainBuf.Write(parser.buf)
+		parser.appendBuf.Reset()
+		parser.appendBuf.Write(parser.remainBuf.Bytes())
+		blockData := parser.blockBuf[:n]
+		if parser.pos == 0 {
+			bomCleanedData := bom.Clean(blockData)
+			parser.pos += int64(n - len(bomCleanedData))
+			blockData = bomCleanedData
+		}
+		parser.appendBuf.Write(blockData)
+		parser.buf = parser.appendBuf.Bytes()
+		return nil
+	default:
+		return err
+	}
+}
+
+func (parser *CSVParser) Close() error {
+	return parser.reader.Close()
+}
+
+// LastRow is the copy of the row parsed by the last call to ReadRow().
+func (parser *CSVParser) LastRow() Row {
+	return parser.lastRow
+}
+
+func (parser *CSVParser) Columns() []string {
+	return parser.columns
+}
+
+func (parser *CSVParser) SetColumns(columns []string) {
+	parser.columns = columns
+}
+
+// SetRowID changes the reported row ID when we firstly read compressed files.
+func (parser *CSVParser) SetRowID(rowID int64) {
+	parser.lastRow.RowID = rowID
+}
+
+// Pos returns the current file offset.
+// Attention: for compressed sql/csv files, pos is the position in uncompressed files
+func (parser *CSVParser) Pos() (pos int64, lastRowID int64) {
+	return parser.pos, parser.lastRow.RowID
 }
